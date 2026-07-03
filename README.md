@@ -23,7 +23,7 @@ Scrape, save, and read web pages right inside your terminal, with images, favico
 
 ## Simple Video
 
-![Video About What Features It Has](https://raw.githubusercontent.com/mhrohani1385/terminal-page-saver/refs/heads/main/Screencast%20from%202026-07-03%2022-27-01.mp4)
+https://raw.githubusercontent.com/mhrohani1385/terminal-page-saver/refs/heads/main/Screencast%20from%202026-07-03%2022-27-01.mp4
 
 ---
 
