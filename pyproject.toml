@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "siteinsight"
+version = "0.1.0"
+description = ""
+authors = []
+readme = "README.md"
+package-mode = false 
+
+[tool.poetry.dependencies]
+python = ">=3.12,<4.0"
+textual = "8.2.8"
+textual-image = "^0.13.2"
+bs4 = "^0.0.2"
+requests = "^2.34.2"
+cairosvg = "^2.9.0"
+pillow = "^12.3.0"
+pyperclip = "^1.11.0"
