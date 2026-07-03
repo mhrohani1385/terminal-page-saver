@@ -37,17 +37,21 @@ Browsing the link : https://en.wikipedia.org/wiki/Chicken
    cd terminal-page-saver
    ```
 
-2. **Install Python dependencies** (Python 3.10+ recommended)
+
+2. **Install dependencies with Poetry** (Python 3.10+ recommended)
    ```bash
-   pip install -r requirements.txt
+   poetry install
    ```
-   Or manually:
-   ```bash
-   pip install textual textual-image beautifulsoup4 pillow requests cairosvg
-   ```
+   This automatically creates a virtual environment and installs all required packages.
+
 
 3. **Run the application**
    ```bash
+   poetry run python main.py
+   ```
+   Or activate the Poetry shell first:
+   ```bash
+   poetry shell
    python main.py
    ```
 
