@@ -19,6 +19,12 @@ Scrape, save, and read web pages right inside your terminal, with images, favico
 
 ---
 
+## Simple Video
+
+![Video About What Features It Has]()
+
+---
+
 ## Installation
 
 1. **Clone the repository**
