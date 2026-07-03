@@ -23,7 +23,9 @@ Scrape, save, and read web pages right inside your terminal, with images, favico
 
 ## Simple Video
 
-Uploading Screencast from 2026-07-03 22-27-01.mp4…
+[Screencast from 2026-07-03 22-27-01.webm](https://github.com/user-attachments/assets/08801782-fca6-4a56-85c6-48c57fd2f40f)
+   
+Browsing the link : https://en.wikipedia.org/wiki/Chicken
 
 ---
 
