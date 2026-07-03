@@ -17,11 +17,13 @@ Scrape, save, and read web pages right inside your terminal, with images, favico
 - 🏷️ **Favicons & page titles** – the left sidebar shows each site’s icon and name.
 - 📂 **Offline storage** – all pages and images are saved under `browser_data/` for later reading.
 
+*Note*: Video files are not saved locally. All page content (text, images, etc.) is stored offline and can be viewed without an internet connection – but videos are only referenced by their original URL and require a network connection to play.
+
 ---
 
 ## Simple Video
 
-![Video About What Features It Has]()
+![Video About What Features It Has](https://raw.githubusercontent.com/mhrohani1385/terminal-page-saver/refs/heads/main/Screencast%20from%202026-07-03%2022-27-01.mp4)
 
 ---
 
