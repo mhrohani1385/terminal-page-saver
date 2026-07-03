@@ -118,9 +118,9 @@ No human wrote a single line of code directly; the AI generated, refined, and de
 ## Dependencies
 
 - [Textual](https://textual.textualize.io/) – terminal UI framework
-- [textual-image](https://github.com/Textualize/textual-image) – image rendering in terminals
+- [textual-image](https://github.com/lnqs/textual-image) – image rendering in terminals
 - [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) – HTML parsing
-- [Pillow](https://python-pillow.org/) – image processing
+- [Pillow](https://github.com/python-pillow/Pillow) – image processing
 - [Requests](https://docs.python-requests.org/) – HTTP requests
 - [CairoSVG](https://cairosvg.org/) – SVG to PNG conversion
 - [mpv](https://mpv.io/) – (optional) terminal video playback
