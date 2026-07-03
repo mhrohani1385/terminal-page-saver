@@ -43,6 +43,7 @@ Browsing the link : https://en.wikipedia.org/wiki/Chicken
    poetry install
    ```
    This automatically creates a virtual environment and installs all required packages.
+   If you dont have poetry installed, follow the instructions from [this link](https://python-poetry.org/docs/#installing-with-the-official-installer).
 
 
 3. **Run the application**
