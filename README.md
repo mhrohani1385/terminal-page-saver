@@ -23,7 +23,7 @@ Scrape, save, and read web pages right inside your terminal, with images, favico
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-username/terminal-page-saver.git
+   git clone https://github.com/mhrohani1385/terminal-page-saver.git
    cd terminal-page-saver
    ```
 
