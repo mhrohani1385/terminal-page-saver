@@ -1,11 +1,15 @@
 """
 Terminal Page Saver and Viewer
 A TUI application for saving, managing, and reading web pages in the terminal.
+Now with video playback support (mpv or browser fallback) and poster preview.
 """
 
 import os
 import json
 import re
+import shutil
+import string
+import tempfile
 import threading
 import requests
 import webbrowser
@@ -16,7 +20,7 @@ from io import BytesIO
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 from enum import Enum
-
+import subprocess
 from bs4 import BeautifulSoup
 from PIL import Image as PILImage
 from textual.app import App, ComposeResult
@@ -63,6 +67,7 @@ class PageElementType(Enum):
     CAPTION = "caption"
     FAVICON = "favicon"
     IMAGE_PENDING = "image_pending"
+    VIDEO = "video"               # new video element type
 
 
 @dataclass
@@ -74,7 +79,6 @@ class SavedPageEntry:
     url: Optional[str] = None
     
     def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
         return {
             "path": self.path,
             "title": self.title,
@@ -84,9 +88,7 @@ class SavedPageEntry:
     
     @staticmethod
     def from_dict(data: dict) -> "SavedPageEntry":
-        """Create from dictionary, handling legacy string format."""
         if isinstance(data, str):
-            # Legacy format: just a path string
             folder = os.path.basename(os.path.dirname(data))
             title = folder.split("_", 1)[-1].replace("_", " ") if "_" in folder else folder
             return SavedPageEntry(path=data, title=title, favicon=None)
@@ -96,26 +98,6 @@ class SavedPageEntry:
             favicon=data.get("favicon"),
             url=data.get("url")
         )
-
-
-@dataclass
-class ScrollPosition:
-    """Manages scroll position as a fraction (0.0 to 1.0) for persistence."""
-    index_file: str
-    fraction: float
-    
-    def apply_to_viewer(self, viewer: VerticalScroll) -> bool:
-        """
-        Apply the stored scroll fraction to a viewer widget.
-        
-        Returns:
-            bool: True if successfully applied, False if viewer not ready yet.
-        """
-        max_y = viewer.max_scroll_y
-        if max_y > 0:
-            viewer.scroll_y = int(self.fraction * max_y)
-            return True
-        return False
 
 
 # ============================================================================
@@ -130,35 +112,25 @@ class PageDatabase:
         self._ensure_db_exists()
     
     def _ensure_db_exists(self) -> None:
-        """Create database file if it doesn't exist."""
         os.makedirs(os.path.dirname(self.db_file) or ".", exist_ok=True)
         if not os.path.exists(self.db_file):
             with open(self.db_file, "w") as f:
                 json.dump([], f)
     
     def load_all(self) -> List[SavedPageEntry]:
-        """Load all saved pages from database."""
         with open(self.db_file, "r") as f:
             data = json.load(f)
         return [SavedPageEntry.from_dict(item) for item in data]
     
     def add(self, entry: SavedPageEntry) -> bool:
-        """
-        Add a page to the database if not already present.
-        
-        Returns:
-            bool: True if added, False if already exists.
-        """
         all_entries = self.load_all()
         if any(item.path == entry.path for item in all_entries):
             return False
-        
         all_entries.append(entry)
         self._save_all(all_entries)
         return True
     
     def _save_all(self, entries: List[SavedPageEntry]) -> None:
-        """Save all entries to database file."""
         with open(self.db_file, "w") as f:
             json.dump([e.to_dict() for e in entries], f, indent=2)
 
@@ -168,18 +140,11 @@ class PageDatabase:
 # ============================================================================
 
 class ImageProcessor:
-    """Handles image downloading, conversion, and scaling."""
-    
     @staticmethod
     def scale_for_terminal(pil_img: PILImage.Image) -> PILImage.Image:
-        """
-        Scale an image to fit within terminal display limits.
-        
-        Accounts for terminal cell aspect ratio (characters are ~2x as tall as wide).
-        """
         orig_w, orig_h = pil_img.size
         term_w = orig_w
-        term_h = orig_h / 2.0  # Adjust for terminal cell aspect ratio
+        term_h = orig_h / 2.0
         scale = min(
             Config.MAX_CELL_WIDTH / term_w,
             Config.MAX_CELL_HEIGHT / term_h,
@@ -191,31 +156,22 @@ class ImageProcessor:
     
     @staticmethod
     def parse_svg_dimension(value: Optional[str]) -> Optional[float]:
-        """
-        Parse an SVG dimension string (e.g., "100px", "10em") to a float.
-        Returns None if value is percentage-based or empty.
-        """
         if value is None:
             return None
-        
         value = value.lower().strip()
         if '%' in value or value == '':
             return None
-        
-        # Remove known unit suffixes
         for suffix in ['px', 'em', 'ex', 'pt', 'pc', 'in', 'cm', 'mm']:
             if value.endswith(suffix):
                 value = value[:-len(suffix)]
                 break
-        
         try:
             return float(value)
         except (ValueError, TypeError):
             return None
     
     @staticmethod
-    def convert_svg_to_png(svg_content: bytes, width: int = 100, height: int = 100) -> bytes:
-        """Convert SVG bytes to PNG bytes using cairosvg."""
+    def convert_svg_to_png(svg_content: bytes, width: int = 100, height: int = 100):
         return cairosvg.svg2png(
             bytestring=svg_content,
             output_width=width,
@@ -224,11 +180,8 @@ class ImageProcessor:
 
 
 class FaviconDownloader:
-    """Handles favicon detection and download."""
-    
     @staticmethod
     def get_favicon_url(soup: BeautifulSoup, base_url: str) -> str:
-        """Extract favicon URL from page, or fall back to /favicon.ico."""
         icon_link = soup.find('link', rel=lambda r: r and 'icon' in r.lower())
         if icon_link and icon_link.get('href'):
             return urljoin(base_url, icon_link['href'])
@@ -236,12 +189,6 @@ class FaviconDownloader:
     
     @staticmethod
     def download_and_save(favicon_url: str, save_dir: str) -> Optional[str]:
-        """
-        Download favicon and save as PNG.
-        
-        Returns:
-            Optional[str]: Filename (e.g., "favicon.png") if successful, None otherwise.
-        """
         try:
             resp = requests.get(
                 favicon_url,
@@ -250,27 +197,19 @@ class FaviconDownloader:
             )
             if resp.status_code != 200:
                 return None
-            
             content = resp.content
             content_type = resp.headers.get('Content-Type', '')
             is_svg = 'svg' in content_type or favicon_url.lower().endswith('.svg')
-            
-            # Convert SVG to PNG if needed
             if is_svg:
-                png_data = ImageProcessor.convert_svg_to_png(
-                    content, width=64, height=64
-                )
+                png_data = ImageProcessor.convert_svg_to_png(content, width=64, height=64)
                 img = PILImage.open(BytesIO(png_data))
             else:
                 img = PILImage.open(BytesIO(content))
-            
             img = img.convert('RGBA')
             img.thumbnail((64, 64), PILImage.LANCZOS)
-            
             favicon_path = os.path.join(save_dir, 'favicon.png')
             img.save(favicon_path, 'PNG')
             return 'favicon.png'
-            
         except Exception:
             return None
 
@@ -280,19 +219,11 @@ class FaviconDownloader:
 # ============================================================================
 
 class HTMLContentExtractor:
-    """Extracts and structures content from HTML."""
-    
-    # Tags to remove entirely from parsing
     REMOVE_TAGS = ["script", "style", "iframe"]
-    
-    # Text tags to parse
     TEXT_TAGS = ["p", "h1", "h2", "h3", "h4"]
-    
-    # Caption tags
     CAPTION_TAGS = ["caption", "figcaption"]
-    
-    # All tags to search for
-    SEARCH_TAGS = TEXT_TAGS + ["img"] + CAPTION_TAGS + ["svg"]
+    # Added "video" to search tags
+    SEARCH_TAGS = TEXT_TAGS + ["img"] + CAPTION_TAGS + ["svg", "video"]
     
     def __init__(self, base_url: str, save_dir: str):
         self.base_url = base_url
@@ -301,41 +232,46 @@ class HTMLContentExtractor:
         os.makedirs(self.img_dir, exist_ok=True)
     
     def clean_html(self, soup: BeautifulSoup) -> None:
-        """Remove unwanted tags from the soup."""
         for tag in soup(self.REMOVE_TAGS):
             tag.decompose()
         for noscript_tag in soup("noscript"):
             noscript_tag.unwrap()
     
     def _extract_image_source(self, img_tag) -> Optional[str]:
-        """Extract the best available image source from an img tag."""
-        # Try standard and lazy-loading attributes
         src = (
             img_tag.get("src") or
             img_tag.get("data-src") or
             img_tag.get("data-original") or
             img_tag.get("data-lazy-src")
         )
-        
-        # Fall back to srcset if src not found
         if not src and img_tag.get("srcset"):
             src = img_tag.get("srcset").split(",")[0].strip().split(" ")[0]
-        
         return src
+
+    def _extract_video_source(self, video_tag) -> Optional[str]:
+        """Get the best video source from a <video> element."""
+        src = video_tag.get("src") or video_tag.get("data-src")
+        if src:
+            return src
+        source = video_tag.find("source")
+        if source and source.get("src"):
+            return source["src"]
+        return None
+
+    def _extract_video_poster(self, video_tag) -> Optional[str]:
+        """Return the poster URL for a video, if available."""
+        poster = video_tag.get("poster") or video_tag.get("data-poster")
+        if poster:
+            return urljoin(self.base_url, poster)
+        return None
     
     def _format_text_element(self, tag) -> str:
-        """
-        Convert a text tag's children to formatted text.
-        Handles nested tags like <a>, <b>, <i>, etc.
-        """
         parts = []
         for child in tag.children:
             if child.name is None:
-                # Text node
                 if child.string:
                     parts.append(str(child.string))
             elif child.name == 'a':
-                # Convert links to Textual markup with click handler
                 link_text = child.get_text()
                 href = child.get("href")
                 if href:
@@ -350,20 +286,15 @@ class HTMLContentExtractor:
                 parts.append(f"[i]{child.get_text()}[/i]")
             else:
                 parts.append(child.get_text())
-        
         full_text = "".join(parts)
-        # Normalize whitespace
-        full_text = re.sub(r'\s+', ' ', full_text).strip()
-        return full_text
+        return re.sub(r'\s+', ' ', full_text).strip()
 
 
 # ============================================================================
-# IMAGE DOWNLOAD WORKER
+# IMAGE DOWNLOAD MANAGER
 # ============================================================================
 
 class ImageDownloadManager:
-    """Manages parallel downloading and processing of images."""
-    
     def __init__(self, base_url: str, img_dir: str, status_callback):
         self.base_url = base_url
         self.img_dir = img_dir
@@ -371,7 +302,6 @@ class ImageDownloadManager:
         self.thread_local = threading.local()
     
     def _get_session(self) -> requests.Session:
-        """Get or create a thread-local HTTP session."""
         if not hasattr(self.thread_local, "session"):
             session = requests.Session()
             session.headers.update(Config.HTTP_HEADERS)
@@ -380,95 +310,63 @@ class ImageDownloadManager:
         return self.thread_local.session
     
     def _process_remote_image(self, img_url: str, alt_text: str, caption: str) -> dict:
-        """Download and process a remote image."""
         session = self._get_session()
-        
         try:
             resp = session.get(img_url, timeout=Config.REQUEST_TIMEOUT)
-            
-            # Handle rate limiting
             if resp.status_code == 429:
                 return {
                     "type": PageElementType.IMAGE_FAILED.value,
-                    "alt": alt_text,
-                    "caption": caption,
-                    "error": "HTTP 429 (Rate Limited)",
-                    "error_type": "RateLimitError",
-                    "url": img_url,
-                    "status_code": 429
+                    "alt": alt_text, "caption": caption,
+                    "error": "HTTP 429 (Rate Limited)", "error_type": "RateLimitError",
+                    "url": img_url, "status_code": 429
                 }
-            
-            # Handle other HTTP errors
             if resp.status_code != 200:
                 return {
                     "type": PageElementType.IMAGE_FAILED.value,
-                    "alt": alt_text,
-                    "caption": caption,
-                    "error": f"HTTP {resp.status_code}",
-                    "error_type": "HTTPError",
-                    "url": img_url,
-                    "status_code": resp.status_code
+                    "alt": alt_text, "caption": caption,
+                    "error": f"HTTP {resp.status_code}", "error_type": "HTTPError",
+                    "url": img_url, "status_code": resp.status_code
                 }
-            
             content = resp.content
             content_type = resp.headers.get('Content-Type', '')
             is_svg = 'svg' in content_type or img_url.lower().endswith('.svg')
-            
-            return self._save_image_content(
-                content, img_url, alt_text, caption, is_svg
-            )
-            
+            return self._save_image_content(content, img_url, alt_text, caption, is_svg)
         except Exception as e:
             return {
                 "type": PageElementType.IMAGE_FAILED.value,
-                "alt": alt_text,
-                "caption": caption,
-                "error": str(e),
-                "error_type": type(e).__name__,
+                "alt": alt_text, "caption": caption,
+                "error": str(e), "error_type": type(e).__name__,
                 "url": img_url
             }
     
-    def _process_inline_svg(self, svg_markup: str, alt_text: str, caption: str) -> dict:
-        """Process an inline SVG element."""
+    def _process_inline_svg(self, svg_markup: str, alt_text: str, caption: str, orig_idx: int) -> dict:
         try:
             svg_soup = BeautifulSoup(svg_markup, 'html.parser')
             svg_elem = svg_soup.find('svg')
             if not svg_elem:
                 raise ValueError("No <svg> element found")
             
-            # Ensure white color for visibility on dark terminal
             existing_style = str(svg_elem.get('style', ''))
             if 'color:' not in existing_style.lower():
                 new_style = (existing_style + '; color: white;').strip('; ')
                 svg_elem['style'] = new_style
             
-            # Extract or compute SVG dimensions
             output_w, output_h = self._compute_svg_dimensions(svg_elem)
-            
-            # Remove old dimension attributes
             for attr in ['width', 'height']:
                 if attr in svg_elem.attrs:
                     del svg_elem[attr]
-            
-            # Set new dimensions
             svg_elem['width'] = str(output_w)
             svg_elem['height'] = str(output_h)
-            
-            # Ensure viewBox is set
             if not svg_elem.get('viewBox') and not svg_elem.get('viewbox'):
                 svg_elem['viewBox'] = f"0 0 {output_w} {output_h}"
             
-            # Convert to PNG
             png_data = ImageProcessor.convert_svg_to_png(
-                str(svg_elem).encode('utf-8'),
-                width=output_w,
-                height=output_h
+                str(svg_elem).encode('utf-8'), width=output_w, height=output_h
             )
-            
             pil_img = PILImage.open(BytesIO(png_data))
             pil_img = ImageProcessor.scale_for_terminal(pil_img)
-            
-            png_name = "inline_svg.png"
+
+            png_name = f"img_{orig_idx}_inline.svg.png"
             png_path = os.path.join(self.img_dir, png_name)
             pil_img.save(png_path)
             
@@ -476,159 +374,105 @@ class ImageDownloadManager:
                 "type": PageElementType.IMAGE.value,
                 "local_path": os.path.join("images", png_name),
                 "abs_path": os.path.abspath(png_path),
-                "alt": alt_text,
-                "caption": caption
+                "alt": alt_text, "caption": caption
             }
-            
         except Exception as e:
             return {
                 "type": PageElementType.IMAGE_FAILED.value,
-                "alt": alt_text,
-                "caption": caption,
+                "alt": alt_text, "caption": caption,
                 "error": f"SVG conversion failed: {str(e)}",
                 "error_type": "SVGConversionError",
                 "url": ""
             }
     
     def _compute_svg_dimensions(self, svg_elem) -> Tuple[int, int]:
-        """Extract or compute SVG output dimensions."""
         w_abs = ImageProcessor.parse_svg_dimension(svg_elem.get('width'))
         h_abs = ImageProcessor.parse_svg_dimension(svg_elem.get('height'))
-        
         output_w = output_h = None
-        
-        # Try absolute dimensions first
         if w_abs and h_abs:
             output_w, output_h = int(w_abs), int(h_abs)
         else:
-            # Try viewBox
             viewbox = svg_elem.get('viewbox') or svg_elem.get('viewBox')
             if viewbox:
                 parts = viewbox.split()
                 if len(parts) >= 4:
                     output_w = int(float(parts[2]))
                     output_h = int(float(parts[3]))
-        
-        # Compute from aspect ratio if still missing
         if output_w is None or output_h is None:
             viewbox = svg_elem.get('viewbox') or svg_elem.get('viewBox')
-            if viewbox:
+            if viewbox and len(viewbox.split()) >= 4:
                 parts = viewbox.split()
-                if len(parts) >= 4:
-                    aspect = float(parts[2]) / float(parts[3])
-                else:
-                    aspect = 1.0
+                aspect = float(parts[2]) / float(parts[3])
             elif w_abs and h_abs:
                 aspect = w_abs / h_abs
             else:
                 aspect = 1.0
-            
             output_h = 100
             output_w = int(output_h * aspect)
-        
         return output_w, output_h
     
-    def _save_image_content(
-        self,
-        content: bytes,
-        source_url: str,
-        alt_text: str,
-        caption: str,
-        is_svg: bool
-    ) -> dict:
-        """Save downloaded image content to disk."""
+    def _save_image_content(self, content: bytes, source_url: str, alt_text: str, caption: str, is_svg: bool) -> dict:
         try:
             base_name = f"img_{os.path.basename(source_url.split('?')[0])}"
             base_name = re.sub(r'[\\/*?:"<>|]', "", base_name)
-            
             if is_svg:
-                # Convert SVG to PNG
                 png_data = ImageProcessor.convert_svg_to_png(content)
                 pil_img = PILImage.open(BytesIO(png_data))
                 pil_img = ImageProcessor.scale_for_terminal(pil_img)
                 png_name = os.path.splitext(base_name)[0] + ".png"
                 png_path = os.path.join(self.img_dir, png_name)
                 pil_img.save(png_path)
-                
                 return {
                     "type": PageElementType.IMAGE.value,
                     "local_path": os.path.join("images", png_name),
                     "abs_path": os.path.abspath(png_path),
-                    "alt": alt_text,
-                    "caption": caption
+                    "alt": alt_text, "caption": caption
                 }
             else:
-                # Save as-is, then optimize
                 img_path = os.path.join(self.img_dir, base_name)
                 with open(img_path, "wb") as f:
                     f.write(content)
-                
                 with PILImage.open(img_path) as pil_img:
                     pil_img = ImageProcessor.scale_for_terminal(pil_img)
                 pil_img.save(img_path)
-                
                 return {
                     "type": PageElementType.IMAGE.value,
                     "local_path": os.path.join("images", base_name),
                     "abs_path": os.path.abspath(img_path),
-                    "alt": alt_text,
-                    "caption": caption
+                    "alt": alt_text, "caption": caption
                 }
-                
         except Exception as e:
             return {
                 "type": PageElementType.IMAGE_FAILED.value,
-                "alt": alt_text,
-                "caption": caption,
-                "error": str(e),
-                "error_type": type(e).__name__,
+                "alt": alt_text, "caption": caption,
+                "error": str(e), "error_type": type(e).__name__,
                 "url": source_url
             }
     
-    def process_images(
-        self,
-        image_tasks: List[Tuple]
-    ) -> Dict[int, dict]:
-        """
-        Download and process images in parallel.
-        
-        Args:
-            image_tasks: List of tuples (task_idx, orig_idx, resource, alt, caption, is_inline_svg)
-        
-        Returns:
-            Dict mapping task_idx to processed image results.
-        """
+    def process_images(self, image_tasks: List[Tuple]) -> Dict[int, dict]:
         total = len(image_tasks)
         if total == 0:
             return {}
-        
         results = {}
-        
-        def process_task(task_idx, orig_idx, resource, alt, caption, is_inline_svg):
+        # Process image tasks (including posters)
+        def process_task(task_idx, orig_idx, resource, alt, caption, placeholder_idx, is_inline_svg, is_poster):
             if is_inline_svg:
-                return task_idx, self._process_inline_svg(resource, alt, caption)
+                return task_idx, self._process_inline_svg(resource, alt, caption, orig_idx)
             else:
-                return task_idx, self._process_remote_image(resource, alt, caption)
-        
-        self.status_callback(
-            f"Status: Downloading {total} images (max {Config.MAX_DOWNLOAD_WORKERS} at once)..."
-        )
-        
+                # For posters, we use the same remote image processing; the alt/caption are ignored
+                return task_idx, self._process_remote_image(resource, alt if not is_poster else "", caption if not is_poster else "")
+        self.status_callback(f"Status: Downloading {total} images (max {Config.MAX_DOWNLOAD_WORKERS} at once)...")
         with ThreadPoolExecutor(max_workers=Config.MAX_DOWNLOAD_WORKERS) as executor:
             futures = {
-                executor.submit(process_task, t_idx, o_idx, res, alt, cap, is_inline): t_idx
-                for t_idx, o_idx, res, alt, cap, is_inline in image_tasks
+                executor.submit(process_task, t_idx, o_idx, res, alt, cap, placeholder_idx, is_inline, is_poster): t_idx
+                for t_idx, o_idx, res, alt, cap, placeholder_idx, is_inline, is_poster in image_tasks
             }
-            
             completed = 0
             for future in as_completed(futures):
                 task_idx, result = future.result()
                 results[task_idx] = result
                 completed += 1
-                self.status_callback(
-                    f"Status: Downloaded {completed}/{total} images..."
-                )
-        
+                self.status_callback(f"Status: Downloaded {completed}/{total} images...")
         return results
 
 
@@ -661,8 +505,17 @@ class WebManager(App):
         width: 1fr; 
         height: 100%; 
         border: solid #00aaff; 
-        padding: 1 2; 
         background: #121212; 
+    }
+    
+    .page-scroll {
+        width: 100%;
+        height: 100%;
+        padding: 1 2;
+    }
+    
+    .placeholder-label {
+        padding: 1 2;
     }
     
     ListItem { padding: 1; background: $surface-darken-1; }
@@ -721,10 +574,42 @@ class WebManager(App):
         width: 1fr;
         margin-top: 0;
     }
+    .video-play-link {
+        color: $text;
+        align: center middle;
+        link-color: red;
+        link-style: underline;
+    }
+
+    .video-preview {
+        width: 100%;
+        align: center middle;
+        padding: 1 0;
+        background: #1a1a1a;
+        margin: 1 0;
+    }
+    .video-icon {
+        color: red;
+    }
+    .video-title {
+        color: $text;
+        margin-top: 1;
+    }
+
+    .video-play-container {
+        width: 100%;
+        align: center middle;
+        margin-top: 1;
+    }
+
     """
     
+    BINDINGS = [
+        ("ctrl+v", "play_video", "Play video"),
+        ("ctrl+q", "c_quit", "Quit"),
+    ]
+
     class PageTitleIcon(Horizontal):
-        """Display component: favicon + title + domain for list items."""
         def __init__(self, favicon_path: Optional[str], title: str, domain: str = ""):
             super().__init__(classes="list-item-row")
             self.favicon_path = favicon_path
@@ -732,42 +617,32 @@ class WebManager(App):
             self.domain = domain
 
         def compose(self) -> ComposeResult:
-            # Render favicon if available
             if self.favicon_path and os.path.exists(self.favicon_path):
                 icon = Image(self.favicon_path)
                 icon.styles.width = 6
                 icon.styles.height = 3
                 icon.add_class("list-favicon")
                 yield icon
-            
-            # Text block for title and domain
             yield Vertical(classes="list-text-block")
 
         def on_mount(self):
-            """Mount title and domain labels after layout."""
             text_block = self.query_one(".list-text-block", Vertical)
-            title_label = Label(self.title, classes="list-title")
-            text_block.mount(title_label)
+            text_block.mount(Label(self.title, classes="list-title"))
             if self.domain:
-                domain_label = Label(self.domain, classes="list-domain")
-                text_block.mount(domain_label)
+                text_block.mount(Label(self.domain, classes="list-domain"))
 
     def __init__(self):
         super().__init__()
-        # Initialize database and state
         self.db = PageDatabase(Config.DB_FILE)
         self.files_cache: List[SavedPageEntry] = []
         self._refresh_counter = 0
-        
-        # Scroll position management
-        self._scroll_positions: Dict[str, ScrollPosition] = {}
+        self._page_views: Dict[str, VerticalScroll] = {}
         self._current_index_file: Optional[str] = None
-        self._pending_scroll_position: Optional[ScrollPosition] = None
+        self._current_elements: Optional[List[dict]] = None  # holds elements of current page
 
     # ========== UI Layout ==========
     
     def compose(self) -> ComposeResult:
-        """Compose the main UI layout."""
         yield Header(show_clock=True)
         yield Horizontal(
             Input(placeholder="Enter URL to save...", id="url-input"),
@@ -777,265 +652,159 @@ class WebManager(App):
         )
         with Horizontal(id="workspace"):
             yield ListView(id="page-list")
-            with VerticalScroll(id="viewer-container"):
-                yield Label("Select a page from the left to read inside the terminal...")
+            with Container(id="viewer-container"):
+                yield Label("Select a page from the left to read inside the terminal...", classes="placeholder-label")
         yield Footer()
 
     def on_mount(self) -> None:
-        """Initialize app after mounting."""
         self.refresh_list()
-        
-        # Watch for content changes and restore scroll position
-        viewer = self.query_one("#viewer-container", VerticalScroll)
-        viewer.watch(self, "virtual_size", self._on_viewer_layout_changed)
-
-    def _on_viewer_layout_changed(self, old_size, new_size):
-        """
-        Called when viewer content/layout changes.
-        Attempts to restore saved scroll position.
-        """
-        self._restore_scroll_position()
 
     # ========== Status Management ==========
     
     def update_status(self, text: str) -> None:
-        """Update the status label."""
         self.query_one("#status-label", Label).update(text)
 
     def action_open_link(self, link: str) -> None:
-        """Open a link in the system browser."""
         self.notify(f"Opening browser: {link}")
         webbrowser.open(link)
 
     # ========== Database and List Management ==========
     
     def refresh_list(self) -> None:
-        """Refresh the page list from database."""
         list_view = self.query_one("#page-list", ListView)
         list_view.clear()
-        
-        # Load from database (reversed to show newest first)
         self.files_cache = list(reversed(self.db.load_all()))
         self._refresh_counter += 1
-
-        # Populate list with page entries
         for i, entry in enumerate(self.files_cache):
             favicon_path = None
             if entry.favicon:
-                favicon_path = os.path.join(
-                    os.path.dirname(entry.path),
-                    entry.favicon
-                )
-            
+                favicon_path = os.path.join(os.path.dirname(entry.path), entry.favicon)
             domain = ""
             if entry.url:
                 parsed = urlparse(entry.url)
                 domain = parsed.netloc.replace("www.", "")
-            
             row = self.PageTitleIcon(favicon_path, entry.title, domain)
-            list_item = ListItem(row, id=f"item_{i}_{self._refresh_counter}")
-            list_view.append(list_item)
+            list_view.append(ListItem(row, id=f"item_{i}_{self._refresh_counter}"))
 
     # ========== User Interactions ==========
     
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Handle URL submission via Enter key."""
         self.start_download(event.value)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Handle Save button press."""
         url = self.query_one("#url-input", Input).value
         self.start_download(url)
 
     def start_download(self, url: str) -> None:
-        """Start downloading a page."""
         if not url:
             return
         self.query_one("#url-input", Input).value = ""
         self.save_page_worker(url)
 
+    # ========== Page switching (persistent views) ==========
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        """Handle page selection from list."""
-        viewer = self.query_one("#viewer-container", VerticalScroll)
-
-        # Save current scroll position before switching
-        if self._current_index_file is not None:
-            self._save_current_scroll_position(viewer)
-
-        # Parse list item ID to get index
         parts = event.item.id.split("_")
         index = int(parts[1])
-        
         if index >= len(self.files_cache):
             self.notify("Invalid page selection", severity="error")
             return
         
         entry = self.files_cache[index]
         index_file = entry.path
-        structure_file = os.path.join(
-            os.path.dirname(index_file),
-            "structure.json"
-        )
-
-        # Validate structure file exists
+        structure_file = os.path.join(os.path.dirname(index_file), "structure.json")
         if not os.path.exists(structure_file):
             self.notify("Structure file not found!", severity="error")
-            self._current_index_file = None
             return
 
-        # Load and render new page
         self._current_index_file = index_file
-        self.render_page_content(structure_file)
+
+        # Create the page view if this page hasn't been opened yet
+        if index_file not in self._page_views:
+            self._create_page_view(index_file, structure_file)
+
+        # Show the selected page, hide all others
+        self._switch_to_page(index_file)
         self.title = f"Reading TUI: {entry.title}"
-        
-        # Prepare scroll position restoration
-        if index_file in self._scroll_positions:
-            self._pending_scroll_position = self._scroll_positions[index_file]
-        else:
-            self._pending_scroll_position = None
-        
-        # Attempt immediate restoration
-        self._restore_scroll_position()
 
-    def _save_current_scroll_position(self, viewer: VerticalScroll) -> None:
-        """Save the current scroll position."""
-        if self._current_index_file is None:
-            return
-        
-        max_y = viewer.max_scroll_y
-        fraction = viewer.scroll_y / max_y if max_y > 0 else 0.0
-        
-        self._scroll_positions[self._current_index_file] = ScrollPosition(
-            index_file=self._current_index_file,
-            fraction=fraction
-        )
+        # Load current elements for video lookup
+        with open(structure_file, "r", encoding="utf-8") as f:
+            self._current_elements = json.load(f)
 
-    def _restore_scroll_position(self) -> None:
-        """
-        Restore saved scroll position if available.
-        Only applies if viewer layout is ready (max_scroll_y > 0).
-        """
-        if self._pending_scroll_position is None:
-            return
+    def _create_page_view(self, index_file: str, structure_file: str) -> None:
+        viewer_container = self.query_one("#viewer-container")
+        # Hide the placeholder label once we have at least one page
+        placeholder = viewer_container.query_one(".placeholder-label")
+        if placeholder:
+            placeholder.display = False
         
-        viewer = self.query_one("#viewer-container", VerticalScroll)
-        
-        if self._pending_scroll_position.apply_to_viewer(viewer):
-            # Successfully applied
-            self._pending_scroll_position = None
+        page_view = VerticalScroll(classes="page-scroll")
+        viewer_container.mount(page_view)
+        self._render_page_into(page_view, structure_file)
+        self._page_views[index_file] = page_view
+
+    def _switch_to_page(self, index_file: str) -> None:
+        for path, view in self._page_views.items():
+            view.display = (path == index_file)
+
+    def _render_page_into(self, view: VerticalScroll, json_path: str) -> None:
+        view.remove_children()
+        with open(json_path, "r", encoding="utf-8") as f:
+            elements = json.load(f)
+        if elements and elements[0].get("type") == PageElementType.FAVICON.value:
+            elements = elements[1:]
+        for item in elements:
+            self._render_element(view, item)
 
     # ========== Content Rendering ==========
     
-    def render_page_content(self, json_path: str) -> None:
-        """
-        Render saved page structure to the viewer.
-        
-        Reads structure.json and mounts appropriate widgets for each element.
-        """
-        viewer = self.query_one("#viewer-container", VerticalScroll)
-        
-        # Clear previous content
-        self.query("#viewer-container > *").remove()
-
-        # Load structure from file
-        with open(json_path, "r", encoding="utf-8") as f:
-            elements = json.load(f)
-
-        # Skip favicon element if present
-        if elements and elements[0].get("type") == PageElementType.FAVICON.value:
-            elements = elements[1:]
-
-        # Render each element
-        for item in elements:
-            self._render_element(viewer, item)
-
-    def _render_element(self, viewer: VerticalScroll, item: dict) -> None:
-        """Render a single content element to the viewer."""
+    def _render_element(self, view: VerticalScroll, item: dict) -> None:
         elem_type = item.get("type")
-        
         if elem_type == PageElementType.TEXT.value:
-            self._render_text_element(viewer, item)
+            self._render_text_element(view, item)
         elif elem_type == PageElementType.CAPTION.value:
-            self._render_caption(viewer, item)
+            self._render_caption(view, item)
         elif elem_type in [PageElementType.IMAGE.value, PageElementType.IMAGE_FAILED.value]:
-            self._render_image_element(viewer, item)
+            self._render_image_element(view, item)
+        elif elem_type == PageElementType.VIDEO.value:
+            self._render_video_element(view, item)
 
-    def _render_text_element(self, viewer: VerticalScroll, item: dict) -> None:
-        """Render a text element (heading or paragraph)."""
+    def _render_text_element(self, view: VerticalScroll, item: dict) -> None:
         tag_name = item.get("tag_name", "p")
         value = item.get("value", "")
-        
         if tag_name == "h1":
-            viewer.mount(Label(
-                f" {value.upper()} ",
-                classes="reader-h1",
-                markup=True
-            ))
+            view.mount(Label(f" {value.upper()} ", classes="reader-h1", markup=True))
         elif tag_name in ["h2", "h3", "h4"]:
-            viewer.mount(Label(value, classes="reader-h2", markup=True))
+            view.mount(Label(value, classes="reader-h2", markup=True))
         else:
-            viewer.mount(Label(value, classes="reader-p", markup=True))
+            view.mount(Label(value, classes="reader-p", markup=True))
 
-    def _render_caption(self, viewer: VerticalScroll, item: dict) -> None:
-        """Render a caption element."""
-        viewer.mount(Label(
-            f"📝 {item.get('value', '')}",
-            classes="reader-caption",
-            markup=True
-        ))
+    def _render_caption(self, view: VerticalScroll, item: dict) -> None:
+        view.mount(Label(f"📝 {item.get('value', '')}", classes="reader-caption", markup=True))
 
-    def _render_image_element(self, viewer: VerticalScroll, item: dict) -> None:
-        """Render an image or failed image element."""
+    def _render_image_element(self, view: VerticalScroll, item: dict) -> None:
         wrapper = Container(classes="image-wrapper")
-        viewer.mount(wrapper)
-        
-        # Render image if file exists
+        view.mount(wrapper)
         if item.get("type") == PageElementType.IMAGE.value:
             abs_path = item.get("abs_path")
             if abs_path and os.path.exists(abs_path):
                 try:
                     self._render_image_widget(wrapper, abs_path)
                 except Exception:
-                    # Fallback: render with default size
                     self._render_image_widget(wrapper, abs_path, fallback=True)
             else:
-                wrapper.mount(Label(
-                    "🖼️ [Local Image File Missing]",
-                    classes="reader-caption"
-                ))
+                wrapper.mount(Label("🖼️ [Local Image File Missing]", classes="reader-caption"))
         else:
-            # Image failed to download
-            wrapper.mount(Label(
-                "🖼️ [Image Failed to Load]",
-                classes="reader-caption"
-            ))
-        
-        # Render alt text and caption
+            wrapper.mount(Label("🖼️ [Image Failed to Load]", classes="reader-caption"))
         if item.get("alt"):
-            viewer.mount(Label(
-                f"[b]Alt Text:[/b] {item['alt']}",
-                classes="reader-caption",
-                markup=True
-            ))
+            view.mount(Label(f"[b]Alt Text:[/b] {item['alt']}", classes="reader-caption", markup=True))
         if item.get("caption"):
-            viewer.mount(Label(
-                f"[b]Caption:[/b] {item['caption']}",
-                classes="reader-caption",
-                markup=True
-            ))
+            view.mount(Label(f"[b]Caption:[/b] {item['caption']}", classes="reader-caption", markup=True))
 
-    def _render_image_widget(
-        self,
-        container: Container,
-        img_path: str,
-        fallback: bool = False
-    ) -> None:
-        """Mount an image widget with appropriate sizing."""
+    def _render_image_widget(self, container: Container, img_path: str, fallback: bool = False) -> None:
         img_widget = Image(img_path)
         img_widget.add_class("reader-image")
-        
         if not fallback:
-            # Calculate optimal size
             try:
                 with PILImage.open(img_path) as pil_img:
                     orig_w, orig_h = pil_img.size
@@ -1052,230 +821,280 @@ class WebManager(App):
                 img_widget.styles.height = final_h
             except Exception:
                 fallback = True
-        
         if fallback:
-            # Use default fallback size
             img_widget.styles.width = 45
             img_widget.styles.height = 16
-        
         container.mount(img_widget)
+
+    # ========== Video Rendering ==========
+
+    def _fallback_preview(self, view: VerticalScroll, alt_text: str) -> None:
+        """Mount a film-reel emoji as a placeholder, directly into the view."""
+        view.mount(Label("🎬", classes="video-icon"))
+        if alt_text:
+            view.mount(Label(alt_text, classes="video-title"))
+
+    def _render_video_element(self, view: VerticalScroll, item: dict) -> None:
+        url = item.get("url", "")
+        poster_local = item.get("poster_local")
+        alt = item.get("alt", "")
+
+        # 1. Poster (exact same logic as regular images)
+        if poster_local and self._current_index_file is not None:
+            page_dir = os.path.dirname(self._current_index_file)
+            abs_poster_path = os.path.join(page_dir, poster_local)
+            if os.path.exists(abs_poster_path):
+                wrapper = Container(classes="image-wrapper")
+                view.mount(wrapper)
+                self._render_image_widget(wrapper, abs_poster_path)
+            else:
+                self._fallback_preview(view, alt)
+        else:
+            self._fallback_preview(view, alt)
+
+        # 2. Red play link (centered)
+        safe_url = url.replace('"', '%22').replace("'", '%27')
+        play_link = f"[@click=\"app.play_video('{safe_url}')\"]====-- ▶ Play Video --====[/]"
+        play_container = Container(classes="video-play-container")
+        view.mount(play_container)
+        play_container.mount(Label(play_link, classes="video-play-link", markup=True))
+
+    # ========== Video Playback ==========
+
+    def get_current_video_url(self) -> Optional[str]:
+        """Return the URL of the first video in the current page, if any."""
+        if not self._current_elements:
+            return None
+        for item in self._current_elements:
+            if item.get("type") == PageElementType.VIDEO.value:
+                return item.get("url")
+        return None
+
+    def action_play_video(self, video_url: Optional[str] = None) -> None:
+        """Play a video. Called from keybinding or clickable link."""
+        self.notify("Trying to play video!", severity="information")   # <-- debug
+        if video_url is None:
+            video_url = self.get_current_video_url()
+        if not video_url:
+            self.notify("No video on this page", severity="warning")
+            return
+        if shutil.which("mpv"):
+            self._play_with_mpv(video_url)
+        else:
+            self._play_in_browser(video_url)
+
+    @staticmethod
+    def _create_mpv_input_conf() -> str:
+        """Create a temporary mpv input.conf that binds common keys to 'quit'."""
+        import tempfile
+        import string
+        keys = list(string.printable)
+        keys += ["q", "SPACE", "ENTER", "ESC", "UP", "DOWN", "LEFT", "RIGHT",
+                "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9",
+                "F10", "F11", "F12"]
+        conf_content = "\n".join(f"{key} quit" for key in keys)
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".conf", delete=False)
+        tmp.write(conf_content)
+        tmp.close()
+        return tmp.name
+
+    def _play_with_mpv(self, video_url: str) -> None:
+        """Suspend TUI, play video, and restore terminal afterwards."""
+        self.suspend()
+        try:
+            # Build a temporary input.conf that quits on any key
+            conf_path = self._create_mpv_input_conf()
+            # --term-reset: tell mpv to restore the terminal state when done
+            subprocess.run(
+                [
+                    "mpv",
+                    "--vo=tct",
+                    "--really-quiet",
+                    f"--input-conf={conf_path}",
+                    video_url
+                ],
+                check=False,
+            )
+            # Clean up temp config
+            try:
+                os.unlink(conf_path)
+            except Exception:
+                pass
+            # print("\033c", end="", flush=True)
+        finally:
+            # Textual resumes automatically after suspend()
+            os.system("clear")
+
+
+    def _play_in_browser(self, video_url: str) -> None:
+        """Open the video URL in the default web browser."""
+        webbrowser.open(video_url)
+        self.notify("Opening video in browser...")
 
     # ========== Page Download and Parsing ==========
     
     @work(thread=True)
     def save_page_worker(self, url: str) -> None:
-        """
-        Worker thread: Download, parse, and save a web page.
-        """
         try:
-            # Ensure URL has a protocol
             if not url.startswith("http"):
                 url = "https://" + url
-            
             self.call_from_thread(self.update_status, "Status: Fetching webpage data...")
-            
-            # Fetch page
             resp = requests.get(url, headers=Config.HTTP_HEADERS, timeout=15)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.content, 'html.parser')
             
-            # Generate page directory and metadata
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             real_title = soup.title.string.strip() if soup.title else "Untitled"
-            display_title = (
-                real_title[:50] + "..." if len(real_title) > 50 else real_title
-            )
-            safe_title = "".join(
-                [c if c.isalnum() else "_" for c in real_title]
-            )[:20]
+            display_title = real_title[:50] + "..." if len(real_title) > 50 else real_title
+            safe_title = "".join([c if c.isalnum() else "_" for c in real_title])[:20]
             article_dir = os.path.join(Config.BASE_DIR, f"{timestamp}_{safe_title}")
             os.makedirs(article_dir, exist_ok=True)
             
-            # Clean HTML
             extractor = HTMLContentExtractor(url, article_dir)
             extractor.clean_html(soup)
             
-            # Parse content and download images
-            self.call_from_thread(
-                self.update_status,
-                "Status: Extracting and downloading content..."
-            )
+            self.call_from_thread(self.update_status, "Status: Extracting and downloading content...")
             page_structure = self._parse_page_content(soup, article_dir, url)
             
-            # Download favicon
             favicon_filename = FaviconDownloader.download_and_save(
-                FaviconDownloader.get_favicon_url(soup, url),
-                article_dir
+                FaviconDownloader.get_favicon_url(soup, url), article_dir
             )
             
-            # Save structure to JSON
-            self.call_from_thread(
-                self.update_status,
-                "Status: Saving structural database..."
-            )
+            self.call_from_thread(self.update_status, "Status: Saving structural database...")
             structure_file = os.path.join(article_dir, "structure.json")
             with open(structure_file, "w", encoding="utf-8") as f:
                 json.dump(page_structure, f, ensure_ascii=False, indent=4)
             
-            # Save original HTML
             index_file = os.path.join(article_dir, "index.html")
             with open(index_file, "w", encoding="utf-8") as f:
                 f.write(str(soup))
             
-            # Save to database
             entry = SavedPageEntry(
-                path=index_file,
-                title=display_title,
-                favicon=favicon_filename,
-                url=url
+                path=index_file, title=display_title,
+                favicon=favicon_filename, url=url
             )
             self.db.add(entry)
             
-            # Update UI
             self.call_from_thread(self.refresh_list)
             self.call_from_thread(self.update_status, "Status: Ready")
-            self.call_from_thread(
-                self.notify,
-                f"Saved & Parsed: {display_title}"
-            )
-            
+            self.call_from_thread(self.notify, f"Saved & Parsed: {display_title}")
         except Exception as e:
             self.call_from_thread(self.update_status, "Status: Error!")
-            self.call_from_thread(
-                self.notify,
-                str(e),
-                title="Scrape Error",
-                severity="error"
-            )
+            self.call_from_thread(self.notify, str(e), title="Scrape Error", severity="error")
 
-    def _parse_page_content(
-        self,
-        soup: BeautifulSoup,
-        article_dir: str,
-        base_url: str
-    ) -> List[dict]:
-        """
-        Parse page content and download images.
-        
-        Returns:
-            List of structured page elements.
-        """
+    def _parse_page_content(self, soup: BeautifulSoup, article_dir: str, base_url: str) -> List[dict]:
         extractor = HTMLContentExtractor(base_url, article_dir)
         img_dir = os.path.join(article_dir, "images")
-        
         ordered_elements = []
         processed_tags = set()
-        image_tasks = []
+        image_tasks = []         # now each task is (task_idx, orig_idx, resource, alt, caption, placeholder_idx, is_inline_svg, is_poster)
         task_idx = 0
-        
-        # Find all relevant tags
+        video_poster_tasks = []  # list of (video_element_index, poster_task_idx)
+
         tags = soup.find_all(extractor.SEARCH_TAGS)
-        
         for orig_idx, tag in enumerate(tags):
             if tag in processed_tags:
                 continue
-            
             if tag.name == 'img':
-                # Process image tag
                 src = extractor._extract_image_source(tag)
                 if not src or src.startswith("data:"):
                     processed_tags.add(tag)
                     continue
-                
                 alt_text = tag.get("alt", "").strip()
                 img_url = urljoin(base_url, src)
                 caption_text = ""
-                
-                # Try to find associated caption
                 next_sib = tag.find_next_sibling()
                 if next_sib and next_sib.name in extractor.CAPTION_TAGS:
                     caption_text = next_sib.get_text(" ", strip=True)
                     processed_tags.add(next_sib)
-                
-                # Add placeholder and queue download
                 placeholder_index = len(ordered_elements)
-                ordered_elements.append({
-                    "type": PageElementType.IMAGE_PENDING.value,
-                    "task_idx": task_idx
-                })
+                ordered_elements.append({"type": PageElementType.IMAGE_PENDING.value, "task_idx": task_idx})
                 image_tasks.append((
-                    task_idx, orig_idx, img_url, alt_text,
-                    caption_text, placeholder_index, False
-                ))
+                    task_idx, orig_idx, img_url, alt_text, caption_text,
+                    placeholder_index, False, False   # is_inline_svg=False, is_poster=False
+                ))                
                 task_idx += 1
                 processed_tags.add(tag)
-                
             elif tag.name == 'svg':
-                # Process inline SVG
-                alt_text = (
-                    tag.get("aria-label", "").strip() or
-                    tag.get("title", "").strip()
-                )
+                alt_text = tag.get("aria-label", "").strip() or tag.get("title", "").strip()
                 svg_markup = str(tag)
                 caption_text = ""
-                
-                # Try to find associated caption
                 next_sib = tag.find_next_sibling()
                 if next_sib and next_sib.name in extractor.CAPTION_TAGS:
                     caption_text = next_sib.get_text(" ", strip=True)
                     processed_tags.add(next_sib)
-                
-                # Add placeholder and queue processing
                 placeholder_index = len(ordered_elements)
-                ordered_elements.append({
-                    "type": PageElementType.IMAGE_PENDING.value,
-                    "task_idx": task_idx
-                })
+                ordered_elements.append({"type": PageElementType.IMAGE_PENDING.value, "task_idx": task_idx})
                 image_tasks.append((
-                    task_idx, orig_idx, svg_markup, alt_text,
-                    caption_text, placeholder_index, True
-                ))
+                    task_idx, orig_idx, svg_markup, alt_text, caption_text,
+                    placeholder_index, True, False    # is_inline_svg=True, is_poster=False
+                ))                
                 task_idx += 1
                 processed_tags.add(tag)
-                
+            elif tag.name == 'video':
+                video_src = extractor._extract_video_source(tag)
+                if not video_src:
+                    processed_tags.add(tag)
+                    continue
+                video_url = urljoin(base_url, video_src)
+                poster_url = extractor._extract_video_poster(tag)
+                alt_text = tag.get("title", "").strip() or tag.get("aria-label", "").strip()
+
+                video_element = {
+                    "type": PageElementType.VIDEO.value,
+                    "url": video_url,
+                    "poster_local": None,   # will be filled after download
+                    "alt": alt_text
+                }
+                video_idx = len(ordered_elements)
+                ordered_elements.append(video_element)
+
+                # If poster exists, create an image task for it
+                if poster_url:
+                    placeholder_index = video_idx  # not used for posters; we'll update directly
+                    image_tasks.append((
+                        task_idx, orig_idx, poster_url, "", "", placeholder_index, False, True  # is_poster=True
+                    ))
+                    video_poster_tasks.append((video_idx, task_idx))
+                    task_idx += 1
+
+                processed_tags.add(tag)
             elif tag.name in extractor.CAPTION_TAGS:
-                # Standalone caption
                 text = tag.get_text(" ", strip=True)
                 if text:
-                    ordered_elements.append({
-                        "type": PageElementType.CAPTION.value,
-                        "value": text
-                    })
+                    ordered_elements.append({"type": PageElementType.CAPTION.value, "value": text})
                 processed_tags.add(tag)
-                
             elif tag.name in extractor.TEXT_TAGS:
-                # Text element (paragraph or heading)
                 full_text = extractor._format_text_element(tag)
                 if full_text:
-                    ordered_elements.append({
-                        "type": PageElementType.TEXT.value,
-                        "tag_name": tag.name,
-                        "value": full_text
-                    })
+                    ordered_elements.append({"type": PageElementType.TEXT.value, "tag_name": tag.name, "value": full_text})
                 processed_tags.add(tag)
-        
-        # Download images if any
         if image_tasks:
-            downloader = ImageDownloadManager(
-                base_url,
-                img_dir,
-                self.call_from_thread(self.update_status)
-            )
+            downloader = ImageDownloadManager(base_url, img_dir, lambda x: self.call_from_thread(self.update_status, x))
             results = downloader.process_images(image_tasks)
-            
-            # Replace placeholders with actual results
+
+            # Update image placeholders
             for task_idx, result in results.items():
-                for task_t_idx, _, _, _, _, placeholder_idx, _ in image_tasks:
-                    if task_t_idx == task_idx:
+                # Find the corresponding task
+                for t_idx, _, _, _, _, placeholder_idx, _, is_poster in image_tasks:
+                    if t_idx == task_idx and not is_poster:   # don't replace video elements with poster images
                         ordered_elements[placeholder_idx] = result
                         break
-        
+
+            # Update video poster local paths
+            for video_idx, poster_task_idx in video_poster_tasks:
+                poster_result = results.get(poster_task_idx)
+                if poster_result and poster_result.get("type") == PageElementType.IMAGE.value:
+                    # poster_result is an image dict with local_path
+                    ordered_elements[video_idx]["poster_local"] = poster_result["local_path"]
+                # If poster download failed, poster_local remains None
+
         return ordered_elements
+    
+    def action_c_quit(self) -> None:
+        os.system("clear" if os.name == "posix" else "cls")
+        self.exit()
 
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
 
 if __name__ == "__main__":
     WebManager().run()
