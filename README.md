@@ -116,7 +116,7 @@ choco install mpv
 │       ├── structure.json
 │       ├── favicon.png
 │       └── images/
-└── requirements.txt
+└── pyproject.toml ( poetry dependency list )
 ```
 
 ---
